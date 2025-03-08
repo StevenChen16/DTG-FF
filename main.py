@@ -2,66 +2,113 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class DTGLayer(nn.Module):
-    """Dynamic Temperature Goodness Layer
+class DTG_Layer(nn.Module):
+    """Enhanced Dynamic Temperature Goodness Layer
     
-    Core ideas:
-    1. Dynamically adjust temperature based on feature distribution
-    2. Learn adaptive discrimination thresholds
-    3. Use dynamic margin to distinguish positive and negative samples
+    Improvements:
+    1. Learnable feature clarity calculation
+    2. Temperature history tracking and stabilization
+    3. Improved feature normalization
     """
-    def __init__(self, in_dim, out_dim, temp_min=0.1, temp_max=1.0):
+    def __init__(self, in_dim, out_dim, temp_min=0.1, temp_max=2.0, history_size=100):
         super().__init__()
         self.linear = nn.Linear(in_dim, out_dim)
         self.bn = nn.BatchNorm1d(out_dim)
-        self.threshold = nn.Parameter(torch.zeros(1))
         
+        # Feature clarity learning
+        self.clarity_fc = nn.Sequential(
+            nn.Linear(2, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1)
+        )
+        
+        # Temperature parameters
         self.temp_min = temp_min
         self.temp_max = temp_max
+        self.threshold = nn.Parameter(torch.zeros(1))
         
-    def calc_goodness(self, z):
-        """Dynamic temperature goodness calculation
+        # Temperature history
+        self.register_buffer('temp_history', torch.zeros(history_size))
+        self.register_buffer('history_ptr', torch.zeros(1, dtype=torch.long))
         
-        Adaptively adjust temperature based on feature distribution
-        """
-        # Calculate feature statistics
-        z_mean = z.mean(dim=0, keepdim=True)
-        z_std = z.std(dim=0, keepdim=True)
+    def calc_feature_clarity(self, z):
+        """Calculate learnable feature clarity"""
+        z_mean = z.mean(dim=0)
+        z_std = z.std(dim=0)
         
-        # Feature clarity (with numerical stability)
-        feature_clarity = torch.clamp(z_std / (torch.abs(z_mean) + 1e-6), min=0.1, max=10.0).mean()
-        temp = self.temp_min + (self.temp_max - self.temp_min) * torch.sigmoid(feature_clarity)
+        # Construct feature clarity input
+        clarity_input = torch.stack([
+            (z_std / (torch.abs(z_mean) + 1e-6)).mean(),
+            (z_mean.abs() / (z_std + 1e-6)).mean()
+        ])
         
-        # Calculate goodness score (using L2 norm)
-        z_norm = F.normalize(z, p=2, dim=1)  # First normalize features
-        z_scaled = z_norm / (temp + 1e-6)
-        goodness = torch.sum(z_scaled ** 2, dim=1)
-        
-        return goodness, temp
+        # Learn feature clarity
+        feature_clarity = self.clarity_fc(clarity_input)
+        return feature_clarity.squeeze()
+    
+    def update_temp_history(self, temp):
+        """Update temperature history"""
+        idx = self.history_ptr.item()
+        self.temp_history[idx] = temp
+        self.history_ptr[0] = (idx + 1) % self.temp_history.size(0)
+    
+    def get_stable_temp(self, current_temp):
+        """Get stabilized temperature value"""
+        valid_temps = self.temp_history[self.temp_history > 0]
+        if len(valid_temps) > 0:
+            history_mean = valid_temps.mean()
+            history_std = valid_temps.std()
+            
+            # Use history statistics to limit temperature changes
+            max_change = 0.1 * history_mean
+            stable_temp = torch.clamp(
+                current_temp,
+                min=history_mean - max_change,
+                max=history_mean + max_change
+            )
+            
+            # Additional stability constraints
+            if history_std > 0.1:
+                # If temperature fluctuates significantly, prefer historical mean
+                alpha = torch.sigmoid(history_std * 10)
+                stable_temp = alpha * history_mean + (1 - alpha) * stable_temp
+            
+            return stable_temp
+        return current_temp
     
     def forward(self, x):
         """Forward propagation"""
         # Feature transformation
-        z = self.linear(x)
-        z = self.bn(z)
-        z = F.relu(z)  # Maintain non-negativity
+        z = self.bn(self.linear(x))
+        z = F.relu(z)
         
         if self.training:
-            # Training mode: Calculate goodness and related statistics
-            goodness, temp = self.calc_goodness(z)
-            threshold = F.softplus(self.threshold)  # Ensure threshold is positive
+            # Calculate feature clarity and temperature
+            clarity = self.calc_feature_clarity(z)
+            raw_temp = self.temp_min + (self.temp_max - self.temp_min) * torch.sigmoid(clarity)
+            temp = self.get_stable_temp(raw_temp)
+            
+            # Update temperature history
+            with torch.no_grad():
+                self.update_temp_history(temp.detach())
+            
+            # Calculate goodness
+            z_norm = F.normalize(z, p=2, dim=1)
+            goodness = torch.sum((z_norm / (temp + 1e-6)) ** 2, dim=1)
+            threshold = F.softplus(self.threshold)
+            
             return {
                 "features": z,
                 "goodness": goodness,
                 "temperature": temp,
-                "threshold": threshold
+                "threshold": threshold,
+                "clarity": clarity
             }
         else:
-            # Test mode: Only return features
             return z
 
-class FF_DTG_Model(nn.Module):
-    """Dynamic Temperature Goodness Forward-Forward Model"""
+class DTG_Model(nn.Module):
+    """Enhanced Dynamic Temperature Goodness Model"""
     def __init__(self, opt):
         super().__init__()
         self.opt = opt
@@ -70,19 +117,18 @@ class FF_DTG_Model(nn.Module):
         self.layers = nn.ModuleList()
         for i in range(opt.model.num_layers):
             in_dim = opt.input_dim if i == 0 else opt.model.hidden_dim
-            self.layers.append(DTGLayer(
+            self.layers.append(DTG_Layer(
                 in_dim=in_dim,
                 out_dim=opt.model.hidden_dim,
                 temp_min=0.1,
-                temp_max=2.0  # Lower maximum temperature
+                temp_max=2.0
             ))
-            
+        
         # Classifier
-        classifier_in_dim = opt.model.hidden_dim * (opt.model.num_layers - 1)
-        self.classifier = nn.Linear(classifier_in_dim, opt.num_classes)
+        self.classifier = nn.Linear(opt.model.hidden_dim, opt.num_classes)
         
         self._init_weights()
-        
+    
     def _init_weights(self):
         """Initialize model parameters"""
         for m in self.modules():
@@ -91,131 +137,124 @@ class FF_DTG_Model(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
     
-    def _calc_ff_loss(self, goodness, labels, temp, threshold):
-        """Calculate FF loss
+    def calc_loss(self, goodness, labels, temp, threshold, clarity=None):
+        """Calculate loss
         
-        Use dynamic margin and adaptive threshold
+        Added clarity regularization term
         """
-        # Dynamic margin (with range limits)
+        # Dynamic margin
         margin = torch.clamp(threshold * temp, min=0.1, max=2.0)
         
         # Process positive and negative samples separately
         pos_mask = labels == 1
         neg_mask = labels == 0
         
-        # Use log-sum-exp trick for numerical stability
-        pos_diff = F.relu(threshold + margin - goodness[pos_mask])
-        neg_diff = F.relu(goodness[neg_mask] - (threshold - margin))
+        # Main loss
+        pos_loss = F.relu(threshold + margin - goodness[pos_mask]).mean()
+        neg_loss = F.relu(goodness[neg_mask] - (threshold - margin)).mean()
         
-        # Add weights to balance positive and negative samples
-        pos_weight = 1.0 / (pos_mask.float().mean() + 1e-6)
-        neg_weight = 1.0 / (neg_mask.float().mean() + 1e-6)
+        # Add clarity regularization
+        if clarity is not None:
+            # Encourage moderate clarity values
+            clarity_reg = 0.1 * (clarity ** 2).mean()
+        else:
+            clarity_reg = 0
         
-        pos_loss = pos_weight * pos_diff.mean()
-        neg_loss = neg_weight * neg_diff.mean()
-        
-        return (pos_loss + neg_loss) / 2.0
+        return pos_loss + neg_loss + clarity_reg
     
     def forward(self, inputs, labels=None):
         """Forward propagation"""
         outputs = {
-            "Loss": torch.zeros(1, device=self.opt.device),
-            "FF_Loss": torch.zeros(1, device=self.opt.device),
-            "Temperature": torch.zeros(1, device=self.opt.device)
+            "Loss": 0.0,
+            "Temperature": 0.0,
+            "Clarity": 0.0
         }
         
         if not isinstance(inputs, dict):
-            # Non-training mode, return directly
             return outputs
-            
-        # Prepare data
-        pos_z = inputs["pos_images"].reshape(inputs["pos_images"].shape[0], -1)
-        neg_z = inputs["neg_images"].reshape(inputs["neg_images"].shape[0], -1)
         
-        # Store intermediate features
-        pos_features = []
-        neg_features = []
-        
-        # Forward propagation - positive samples
+        # Process positive samples
+        pos_z = inputs["pos_images"].view(inputs["pos_images"].shape[0], -1)
         z = pos_z
         for i, layer in enumerate(self.layers):
             if self.training:
-                layer_outputs = layer(z)
-                z = layer_outputs["features"]
-                pos_features.append(z)
+                layer_out = layer(z)
+                z = layer_out["features"]
                 
-                # Calculate FF loss
-                pos_labels = torch.ones_like(layer_outputs["goodness"])
-                ff_loss = self._calc_ff_loss(
-                    layer_outputs["goodness"], 
-                    pos_labels, 
-                    layer_outputs["temperature"], 
-                    layer_outputs["threshold"]
+                # Calculate loss
+                pos_labels = torch.ones_like(layer_out["goodness"])
+                loss = self.calc_loss(
+                    layer_out["goodness"],
+                    pos_labels,
+                    layer_out["temperature"],
+                    layer_out["threshold"],
+                    layer_out["clarity"]
                 )
-                outputs["FF_Loss"] += ff_loss
-                outputs["Temperature"] += layer_outputs["temperature"]
+                outputs["Loss"] += loss
+                outputs["Temperature"] += layer_out["temperature"]
+                outputs["Clarity"] += layer_out["clarity"]
                 
-                # Calculate accuracy
-                with torch.no_grad():
-                    outputs[f"ff_accuracy_layer_{i}"] = (
-                        layer_outputs["goodness"] > layer_outputs["threshold"]
-                    ).float().mean()
+                # Record accuracy
+                outputs[f"ff_accuracy_layer_{i}"] = (
+                    layer_out["goodness"] > layer_out["threshold"]
+                ).float().mean()
             else:
                 z = layer(z)
-                pos_features.append(z)
         
-        # Forward propagation - negative samples
+        # Process negative samples
+        neg_z = inputs["neg_images"].view(inputs["neg_images"].shape[0], -1)
         z = neg_z
         for i, layer in enumerate(self.layers):
             if self.training:
-                layer_outputs = layer(z)
-                z = layer_outputs["features"]
-                neg_features.append(z)
+                layer_out = layer(z)
+                z = layer_out["features"]
                 
-                # Calculate FF loss
-                neg_labels = torch.zeros_like(layer_outputs["goodness"])
-                ff_loss = self._calc_ff_loss(
-                    layer_outputs["goodness"], 
-                    neg_labels, 
-                    layer_outputs["temperature"], 
-                    layer_outputs["threshold"]
+                # Calculate loss
+                neg_labels = torch.zeros_like(layer_out["goodness"])
+                loss = self.calc_loss(
+                    layer_out["goodness"],
+                    neg_labels,
+                    layer_out["temperature"],
+                    layer_out["threshold"],
+                    layer_out["clarity"]
                 )
-                outputs["FF_Loss"] += ff_loss
+                outputs["Loss"] += loss
             else:
                 z = layer(z)
-                neg_features.append(z)
         
         # Classification task
-        if "neutral_sample" in inputs and "class_labels" in labels:
-            neutral_z = inputs["neutral_sample"].reshape(inputs["neutral_sample"].shape[0], -1)
-            features = []
+        if "neutral_sample" in inputs and labels is not None and "class_labels" in labels:
+            neutral_z = inputs["neutral_sample"].view(inputs["neutral_sample"].shape[0], -1)
+            z = neutral_z
             
             # Extract features
-            z = neutral_z
-            for layer in self.layers[:-1]:  # Skip the last layer
+            for layer in self.layers[:-1]:
                 if self.training:
                     z = layer(z)["features"]
                 else:
                     z = layer(z)
-                features.append(z)
             
             # Classification prediction
-            concat_features = torch.cat(features, dim=1)
-            logits = self.classifier(concat_features)
+            logits = self.classifier(z)
             cls_loss = F.cross_entropy(logits, labels["class_labels"])
-            outputs["Loss"] = outputs["FF_Loss"] + cls_loss
+            outputs["Loss"] += cls_loss
             
             # Calculate classification accuracy
             with torch.no_grad():
                 preds = torch.argmax(logits, dim=1)
-                outputs["classification_accuracy"] = (preds == labels["class_labels"]).float().mean()
-        else:
-            outputs["Loss"] = outputs["FF_Loss"]
+                outputs["classification_accuracy"] = (
+                    preds == labels["class_labels"]
+                ).float().mean()
+        
+        # Calculate averages
+        num_layers = len(self.layers)
+        outputs["Temperature"] /= num_layers
+        outputs["Clarity"] /= num_layers
         
         return outputs
 
-class FF_DTG_Config:
-    """Dynamic Temperature Goodness Configuration"""
+class DTG_Config:
+    """Enhanced Dynamic Temperature Goodness Configuration"""
     def __init__(self):
         self.seed = 42
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -224,7 +263,7 @@ class FF_DTG_Config:
         self.input = type('', (), {})()
         self.input.path = "data"
         self.input.batch_size = 128
-        self.input.dataset = "mnist"  # 'mnist' or 'cifar10'
+        self.input.dataset = "mnist"
         
         # Model settings
         self.model = type('', (), {})()
@@ -240,4 +279,4 @@ class FF_DTG_Config:
         
         # Set input dimensions based on dataset
         self.input_dim = 784  # Default for MNIST
-        self.num_classes = 10  # Both MNIST and CIFAR-10 have 10 classes
+        self.num_classes = 10
