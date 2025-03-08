@@ -45,7 +45,7 @@ DTG-FF achieves:
 
 ## Requirements
 
-- PyTorch >= 1.7.0
+- PyTorch >= 2.4.0
 - torchvision
 - numpy
 - matplotlib (for visualization)
@@ -84,7 +84,7 @@ If you use this code, please cite the original paper:
 ```
 @article{DTG-FF-2025,
   title={Dynamic Temperature Goodness for Enhanced Forward-Forward Learning},
-  author={Anonymous},
+  author={Yucheng Chen},
   booktitle={ICCV},
   year={2025}
 }
